@@ -500,8 +500,7 @@ display_results(final_result)
 # JSON保存
 with open(str(Path(WORKDIR) / "check_result.json"), "w", encoding="utf-8") as f:
     json.dump(final_result, f, ensure_ascii=False, indent=2)
-print(f"
-結果を {Path(WORKDIR) / "check_result.json"} に保存しました")
+print(f"結果を {Path(WORKDIR) / "check_result.json"} に保存しました")
 
 # トークン合計
 total_in  = msg1.usage.input_tokens  + msg3.usage.input_tokens
