@@ -213,8 +213,16 @@ def _agent2_numeric_checks(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def run_check_by_claude(payload: Dict[str, Any]) -> Dict[str, Any]:
     """API から呼ばれるエントリポイント。
-    入力payload（BS/PL と pdfurls）を受け、PDF品質チェック + 数値検算 + 最終判定を返す。
+
+    方針: Colab 版の処理ロジック（プロンプト含む）を極力そのまま使うため、
+    app/pipeline/originals/colab1-1-checkByClaude.py を subprocess で実行し、
+    生成された check_result.json の中身を API の戻り値として返す。
+
+    - 入力: payload（BS/PL/MFG/SGA, pdfurls など）
+    - 出力: check_result.json の内容（dict）
     """
+
+    # nodoai=true のときは互換的にスキップ
     if payload.get("nodoai") is True:
         return {
             "ai_case_id": payload.get("ai_case_id"),
@@ -224,143 +232,67 @@ def run_check_by_claude(payload: Dict[str, Any]) -> Dict[str, Any]:
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
+    script_path = ORIGINALS_DIR / "colab1-1-checkByClaude.py"
+    if not script_path.exists():
+        return {
+            "status": "error",
+            "message": "colab1-1-checkByClaude.py が見つかりません",
+            "path": str(script_path),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    # リクエストごとに作業ディレクトリを分離（同時実行の衝突回避）
     run_dir = Path(tempfile.mkdtemp(prefix="checkbyclaude_", dir="/tmp"))
+    out_path = run_dir / "check_result.json"
 
-    # PDF 取得（S3）
-    pdf_uris = _split_pdfurls(payload.get("pdfurls"))
-    local_pdfs: List[Path] = []
-    for uri in pdf_uris:
-        if uri.startswith("s3://"):
-            local_pdfs.append(_download_s3_to_tmp(uri, run_dir, index=len(local_pdfs)+1))
-        else:
-            # http(s) 等は現状未対応（必要なら curl/wget を追加）
-            raise ValueError(f"Unsupported pdf url scheme: {uri}")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(PROJECT_ROOT)
+    env["WORKDIR"] = str(run_dir)
 
-    # Agent2（数値検算）
-    agent2 = _agent2_numeric_checks(payload)
+    # Colab版は MODEL を固定値で持っているため、Cloud Run 側の環境変数で上書きできるようにしている
+    # (originals 側で CLAUDE_MODEL を参照)
 
-    # Agent1 / Agent3（Claude）
-    client = _anthropic_client()
-    model = os.getenv("CLAUDE_MODEL") or "claude-3-5-sonnet-latest"
-
-    # PDF を base64 へ
-    docs = []
-    for p in local_pdfs:
-        b64 = base64.standard_b64encode(p.read_bytes()).decode("utf-8")
-        docs.append(
-            {
-                "type": "document",
-                "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
-            }
-        )
-
-    agent1_prompt = """あなたはPDF読取品質の検査員です。
-添付された決算書PDFを見て、以下のみをチェックしてください。
-
-## チェック対象（読取品質のみ）
-- PDF画像の鮮明度・傾き・ノイズ
-- 文字の潰れ・かすれ・影による読みにくさ
-- 墨消し（黒塗り）の範囲と読取への影響
-- スキャン品質として問題のある箇所
-
-## 出力
-次のJSONのみを返してください（説明文は不要）:
-{
-  "overall": "OK|WARN|NG",
-  "issues": [{"page_hint": "string", "severity": "low|mid|high", "detail": "string"}],
-  "notes": "string"
-}
-"""
-
-    msg1 = client.messages.create(
-        model=model,
-        max_tokens=1200,
-        temperature=0,
-        messages=[
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": agent1_prompt}, *docs],
-            }
-        ],
-    )
-    agent1_raw = getattr(msg1, "content", None)
-    # anthropic sdk は content が list で text が入ることが多い
-    agent1_text = ""
-    try:
-        if isinstance(agent1_raw, list):
-            agent1_text = "".join([c.get("text", "") for c in agent1_raw if isinstance(c, dict)])
-        else:
-            agent1_text = str(agent1_raw)
-    except Exception:
-        agent1_text = str(agent1_raw)
-
-    def _parse_json_from_text(t: str) -> Dict[str, Any]:
-        # ```json ...``` 優先。無ければ最初の {..} を拾う
-        m = re.search(r"```json\s*(\{.*?\})\s*```", t, re.DOTALL)
-        if m:
-            return json.loads(m.group(1))
-        m2 = re.search(r"(\{.*\})", t, re.DOTALL)
-        if m2:
-            return json.loads(m2.group(1))
-        raise ValueError(f"Claude からJSONを抽出できませんでした: {t[:300]}")
-
-    agent1 = _parse_json_from_text(agent1_text)
-
-    agent3_prompt = """あなたは最終判定レビュアーです。
-以下の2つの結果を読み、最終的な判定をJSONで返してください。
-
-- agent1: PDF読取品質チェック（画像品質・墨消し影響など）
-- agent2: 数値検算（機械的計算）
-
-## 出力JSON
-{
-  "verdict": "PASS|WARN|FAIL",
-  "reasons": ["string", ...],
-  "recommendations": ["string", ...]
-}
-"""
-
-    msg3 = client.messages.create(
-        model=model,
-        max_tokens=900,
-        temperature=0,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": agent3_prompt},
-                    {"type": "text", "text": "agent1=" + json.dumps(agent1, ensure_ascii=False)},
-                    {"type": "text", "text": "agent2=" + json.dumps(agent2, ensure_ascii=False)},
-                ],
-            }
-        ],
+    p = subprocess.run(
+        ["python3", str(script_path)],
+        input=json.dumps(payload, ensure_ascii=False),
+        text=True,
+        cwd=str(run_dir),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
     )
 
-    agent3_raw = getattr(msg3, "content", None)
-    agent3_text = ""
+    if p.returncode != 0:
+        return {
+            "status": "error",
+            "message": "colab1-1-checkByClaude.py の実行に失敗しました",
+            "returncode": p.returncode,
+            "output_head": (p.stdout or "")[:2000],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    if not out_path.exists():
+        return {
+            "status": "error",
+            "message": "check_result.json が生成されませんでした",
+            "output_head": (p.stdout or "")[:2000],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
     try:
-        if isinstance(agent3_raw, list):
-            agent3_text = "".join([c.get("text", "") for c in agent3_raw if isinstance(c, dict)])
-        else:
-            agent3_text = str(agent3_raw)
-    except Exception:
-        agent3_text = str(agent3_raw)
+        result = json.loads(out_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": "check_result.json のJSON解析に失敗しました",
+            "detail": str(e),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
 
-    agent3 = _parse_json_from_text(agent3_text)
-
-    return {
-        "ai_case_id": payload.get("ai_case_id"),
-        "postingPeriod": payload.get("postingPeriod"),
-        "csvdownloadfilename": payload.get("csvdownloadfilename"),
-        "model": model,
-        "inputs": {
-            "pdfurls": pdf_uris,
-            "has_BS": bool(payload.get("BS")),
-            "has_PL": bool(payload.get("PL") or payload.get("pl")),
-        },
-        "agent1": agent1,
-        "agent2": agent2,
-        "agent3": agent3,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-
+    # API互換用のメタ情報を付与（必要なら）
+    if isinstance(result, dict):
+        result.setdefault("ai_case_id", payload.get("ai_case_id"))
+        result.setdefault("postingPeriod", payload.get("postingPeriod"))
+        result.setdefault("csvdownloadfilename", payload.get("csvdownloadfilename"))
+        result.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+    return result

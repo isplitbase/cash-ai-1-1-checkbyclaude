@@ -1,52 +1,110 @@
 # ============================================================
-# セル1: インストール
+# Cloud Run / API 用 ラッパー（最小修正）
+#
+# 目的:
+# - Colab専用の pip / files.upload / getpass を排除し、非対話環境で動くようにする
+# - 既存のプロンプト/判定ロジックは触らない（下の「セル3」以降）
+# - 入力: stdin から JSON（API payload）
+# - 出力: WORKDIR/check_result.json を生成し、その内容を stdout に JSON で出力
 # ============================================================
-!pip install anthropic --quiet
-print("インストール完了")
 
-# ============================================================
-# セル2: 設定 & ファイルアップロード
-# ============================================================
 import os
+import sys
 import json
 import base64
-from getpass import getpass
-from google.colab import files
+import traceback
+from pathlib import Path
 
-# --- APIキー入力 ---
-ANTHROPIC_API_KEY = getpass("Anthropic API Key を入力してください (sk-ant-...): ")
+# Anthropic APIキーは環境変数から取得（Cloud Run の環境変数で設定）
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY")
+if not ANTHROPIC_API_KEY:
+    sys.stdout.write(json.dumps({"status":"error","message":"ANTHROPIC_API_KEY (or CLAUDE_API_KEY) is not set"}, ensure_ascii=False))
+    sys.exit(2)
 
-# --- ファイルアップロード ---
-print("\n📄 PDFをアップロードしてください（複数選択可）")
-uploaded_pdfs = files.upload()
+# 作業ディレクトリ（runner.py から渡される）
+WORKDIR = os.getenv("WORKDIR", "/tmp")
+Path(WORKDIR).mkdir(parents=True, exist_ok=True)
 
-print("\n📋 OCR結果JSONをアップロードしてください")
-uploaded_json = files.upload()
+def _split_pdfurls(v):
+    if not v:
+        return []
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    s = str(v).strip()
+    if not s:
+        return []
+    return [p.strip() for p in s.split("|,|") if p.strip()]
 
-# --- 保存 ---
-pdf_paths = []
-for fname, content in uploaded_pdfs.items():
-    if fname.endswith(".pdf"):
-        path = f"/content/{fname}"
-        with open(path, "wb") as f:
-            f.write(content)
-        pdf_paths.append(path)
-        print(f"  ✅ PDF: {fname} ({len(content)//1024} KB)")
+def _parse_s3_uri(uri: str):
+    if not uri.startswith("s3://"):
+        raise ValueError(f"Unsupported uri (expected s3://...): {uri}")
+    no_scheme = uri[len("s3://"):]
+    parts = no_scheme.split("/", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError(f"Invalid s3 uri: {uri}")
+    return parts[0], parts[1]
 
-json_path = None
-for fname, content in uploaded_json.items():
-    if fname.endswith(".json"):
-        json_path = f"/content/{fname}"
-        with open(json_path, "wb") as f:
-            f.write(content)
-        print(f"  ✅ JSON: {fname} ({len(content)//1024} KB)")
+def _s3_client():
+    import boto3
+    access_key = os.getenv("S3_ACCESS_KEY")
+    secret_key = os.getenv("S3_SECRET_KEY")
+    region = os.getenv("S3_REGION")
+    if not access_key or not secret_key or not region:
+        raise RuntimeError("S3_ACCESS_KEY / S3_SECRET_KEY / S3_REGION が未設定です。")
+    return boto3.client(
+        "s3",
+        region_name=region,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+    )
 
-if not pdf_paths:
-    print("❌ PDFがアップロードされていません")
-if not json_path:
-    print("❌ JSONがアップロードされていません")
-else:
-    print("\n準備完了！次のセルを実行してください。")
+def _download_s3(uri: str, out_dir: Path, index: int):
+    bucket, key = _parse_s3_uri(uri)
+    base = Path(key).name or f"input_{index}.pdf"
+    stem = Path(base).stem
+    suffix = Path(base).suffix or ".pdf"
+    local = out_dir / f"{stem}_{index}{suffix}"
+    n = 1
+    while local.exists():
+        local = out_dir / f"{stem}_{index}_{n}{suffix}"
+        n += 1
+    _s3_client().download_file(bucket, key, str(local))
+    return str(local)
+
+def _read_payload():
+    raw = sys.stdin.read()
+    if not raw.strip():
+        return {}
+    return json.loads(raw)
+
+# payload -> (pdf_paths, json_data) を生成
+try:
+    payload = _read_payload()
+
+    # PDF を WORKDIR にダウンロード
+    pdf_paths = []
+    for i, uri in enumerate(_split_pdfurls(payload.get("pdfurls")), start=1):
+        if uri.startswith("s3://"):
+            pdf_paths.append(_download_s3(uri, Path(WORKDIR), i))
+        else:
+            raise ValueError(f"Unsupported pdf url scheme: {uri}")
+
+    # OCR結果JSON（BS/PL/製造原価/販売費）を payload から構成
+    json_data = {
+        "BS": payload.get("BS", []) or [],
+        "PL": payload.get("PL", []) or payload.get("pl", []) or [],
+        "製造原価": payload.get("MFG", []) or payload.get("製造原価", []) or [],
+        "販売費": payload.get("SGA", []) or payload.get("販売費", []) or [],
+    }
+
+except Exception as e:
+    sys.stdout.write(json.dumps({
+        "status": "error",
+        "message": "input preparation failed",
+        "detail": str(e),
+        "trace": traceback.format_exc()[:4000],
+    }, ensure_ascii=False))
+    sys.exit(1)
 
 
 # ============================================================
@@ -62,6 +120,8 @@ import json
 from pathlib import Path
 
 MODEL  = "claude-sonnet-4-5-20250929"
+MODEL = os.getenv("CLAUDE_MODEL", MODEL)
+
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 PERIODS = ["今期", "前期", "前々期"]
@@ -109,7 +169,7 @@ print("  ファイル読み込み")
 print("=" * 60)
 pdf_names    = [Path(p).name for p in pdf_paths]
 pdf_b64_list = [load_pdf_as_base64(p) for p in pdf_paths]
-json_data    = json.loads(open(json_path, encoding="utf-8").read())
+# json_data はヘッダで payload から構成済み
 bs  = json_data.get("BS", [])
 pl  = json_data.get("PL", [])
 mfg = json_data.get("製造原価", [])
@@ -438,9 +498,10 @@ def display_results(result):
 display_results(final_result)
 
 # JSON保存
-with open("/content/check_result.json", "w", encoding="utf-8") as f:
+with open(str(Path(WORKDIR) / "check_result.json"), "w", encoding="utf-8") as f:
     json.dump(final_result, f, ensure_ascii=False, indent=2)
-print("\n結果を /content/check_result.json に保存しました")
+print(f"
+結果を {Path(WORKDIR) / "check_result.json"} に保存しました")
 
 # トークン合計
 total_in  = msg1.usage.input_tokens  + msg3.usage.input_tokens
