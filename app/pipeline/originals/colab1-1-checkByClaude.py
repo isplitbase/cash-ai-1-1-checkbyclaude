@@ -14,9 +14,15 @@ import json
 import base64
 import traceback
 from pathlib import Path
-
+import time
+import builtins
+def print(*args, **kwargs):
+    kwargs.setdefault("file", sys.stderr)
+    return builtins.print(*args, **kwargs)
 # Anthropic APIキーは環境変数から取得（Cloud Run の環境変数で設定）
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY")
+RETRY_WAIT_SECONDS = int(os.getenv("RETRY_WAIT_SECONDS", "10"))
+RETRY_MAX = int(os.getenv("RETRY_MAX", "3"))
 if not ANTHROPIC_API_KEY:
     sys.stdout.write(json.dumps({"status":"error","message":"ANTHROPIC_API_KEY (or CLAUDE_API_KEY) is not set"}, ensure_ascii=False))
     sys.exit(2)
@@ -24,6 +30,93 @@ if not ANTHROPIC_API_KEY:
 # 作業ディレクトリ（runner.py から渡される）
 WORKDIR = os.getenv("WORKDIR", "/tmp")
 Path(WORKDIR).mkdir(parents=True, exist_ok=True)
+
+
+
+def call_claude_with_json_retry(*, create_fn, extract_text_fn, parse_fn, validate_fn=None, label="claude"):
+    """
+    Claude API呼び出し→テキスト抽出→JSON抽出(parse)→(任意でvalidate)までを
+    JSONが取れない/形式が違う場合に待ってリトライする。
+    """
+    last_err = None
+    last_raw = None
+
+    for attempt in range(1, RETRY_MAX + 1):
+        try:
+            msg = create_fn()
+            raw = extract_text_fn(msg)
+            last_raw = raw
+
+            obj = parse_fn(raw)  # parse_json_response(raw)
+
+            if validate_fn is not None:
+                validate_fn(obj)  # 形式が違えば例外を投げる
+
+            return msg, obj
+
+        except Exception as e:
+            last_err = e
+            if attempt < RETRY_MAX:
+                time.sleep(RETRY_WAIT_SECONDS)
+                continue
+            raise RuntimeError(
+                f"[{label}] JSON parse/validate failed after {RETRY_MAX} attempts. "
+                f"last_error={type(last_err).__name__}: {last_err}\n"
+                f"raw_head={repr((last_raw or '')[:400])}"
+            ) from last_err
+
+
+def validate_agent1_json(obj):
+    # {"items":[{"level":...,"title":...,"detail":...},...]}
+    if not isinstance(obj, dict) or "items" not in obj or not isinstance(obj["items"], list):
+        raise ValueError("Agent1 JSON schema mismatch: missing items[]")
+    for it in obj["items"]:
+        if not isinstance(it, dict):
+            raise ValueError("Agent1 JSON schema mismatch: item not dict")
+        if it.get("level") not in ("ok", "warn", "error"):
+            raise ValueError("Agent1 JSON schema mismatch: invalid level")
+        if not isinstance(it.get("title", ""), str) or not isinstance(it.get("detail", ""), str):
+            raise ValueError("Agent1 JSON schema mismatch: title/detail must be string")
+
+
+def validate_agent3_json(obj):
+    # {"summary":{...}, "sections":[...]}
+    if not isinstance(obj, dict):
+        raise ValueError("Agent3 JSON schema mismatch: not dict")
+
+    s = obj.get("summary")
+    if not isinstance(s, dict):
+        raise ValueError("Agent3 JSON schema mismatch: missing summary")
+
+    for k in ("ok_count", "warn_count", "error_count"):
+        if k not in s or not isinstance(s[k], int):
+            raise ValueError(f"Agent3 JSON schema mismatch: summary.{k} must be int")
+
+    if s.get("overall") not in ("ok", "warn", "error"):
+        raise ValueError("Agent3 JSON schema mismatch: summary.overall invalid")
+
+    sections = obj.get("sections")
+    if not isinstance(sections, list):
+        raise ValueError("Agent3 JSON schema mismatch: sections must be list")
+
+    for sec in sections:
+        if not isinstance(sec, dict):
+            raise ValueError("Agent3 JSON schema mismatch: section not dict")
+        if not isinstance(sec.get("id", ""), str) or not isinstance(sec.get("title", ""), str):
+            raise ValueError("Agent3 JSON schema mismatch: section id/title must be string")
+        items = sec.get("items")
+        if not isinstance(items, list):
+            raise ValueError("Agent3 JSON schema mismatch: section.items must be list")
+        for it in items:
+            if not isinstance(it, dict):
+                raise ValueError("Agent3 JSON schema mismatch: item not dict")
+            if it.get("level") not in ("ok", "warn", "error"):
+                raise ValueError("Agent3 JSON schema mismatch: invalid item.level")
+            if not isinstance(it.get("title", ""), str) or not isinstance(it.get("detail", ""), str):
+                raise ValueError("Agent3 JSON schema mismatch: title/detail must be string")
+            v = it.get("values", {})
+            if v is not None and not isinstance(v, dict):
+                raise ValueError("Agent3 JSON schema mismatch: values must be dict or omitted")
 
 def _split_pdfurls(v):
     if not v:
@@ -221,12 +314,22 @@ for b64, name in zip(pdf_b64_list, pdf_names):
     })
 agent1_blocks.append({"type": "text", "text": AGENT1_PROMPT})
 
-msg1 = client.messages.create(
-    model=MODEL, max_tokens=2048,
-    messages=[{"role": "user", "content": agent1_blocks}]
+def _create_agent1():
+    return client.messages.create(
+        model=MODEL, max_tokens=2048,
+        messages=[{"role": "user", "content": agent1_blocks}]
+    )
+
+def _extract_text(msg):
+    return "".join(b.text for b in msg.content if hasattr(b, "text"))
+
+msg1, agent1_result = call_claude_with_json_retry(
+    create_fn=_create_agent1,
+    extract_text_fn=_extract_text,
+    parse_fn=parse_json_response,
+    validate_fn=validate_agent1_json,
+    label="agent1"
 )
-raw1 = "".join(b.text for b in msg1.content if hasattr(b, "text"))
-agent1_result = parse_json_response(raw1)
 print(f"完了 — トークン input:{msg1.usage.input_tokens:,} / output:{msg1.usage.output_tokens:,}")
 print(f"検出件数: {len(agent1_result.get('items', []))} 件")
 
@@ -446,12 +549,19 @@ AGENT3_PROMPT = f"""あなたは決算書チェックの最終判定者です。
 6. id:"data_quality"        データ品質（Agent2のデータ型チェック結果）
 """
 
-msg3 = client.messages.create(
-    model=MODEL, max_tokens=8192,
-    messages=[{"role": "user", "content": AGENT3_PROMPT}]
+def _create_agent3():
+    return client.messages.create(
+        model=MODEL, max_tokens=8192,
+        messages=[{"role": "user", "content": AGENT3_PROMPT}]
+    )
+
+msg3, final_result = call_claude_with_json_retry(
+    create_fn=_create_agent3,
+    extract_text_fn=_extract_text,   # Agent1で定義したものを流用可
+    parse_fn=parse_json_response,
+    validate_fn=validate_agent3_json,
+    label="agent3"
 )
-raw3 = "".join(b.text for b in msg3.content if hasattr(b, "text"))
-final_result = parse_json_response(raw3)
 print(f"完了 — トークン input:{msg3.usage.input_tokens:,} / output:{msg3.usage.output_tokens:,}")
 
 
@@ -500,9 +610,12 @@ display_results(final_result)
 # JSON保存
 with open(str(Path(WORKDIR) / "check_result.json"), "w", encoding="utf-8") as f:
     json.dump(final_result, f, ensure_ascii=False, indent=2)
-print(f"結果を {Path(WORKDIR) / "check_result.json"} に保存しました")
+out_path = Path(WORKDIR) / "check_result.json"
+print(f"結果を {out_path} に保存しました")
 
 # トークン合計
 total_in  = msg1.usage.input_tokens  + msg3.usage.input_tokens
 total_out = msg1.usage.output_tokens + msg3.usage.output_tokens
 print(f"APIトークン合計 — input:{total_in:,} / output:{total_out:,}")
+# stdout に最終JSONを出力（APIレスポンス用）
+sys.stdout.write(json.dumps(final_result, ensure_ascii=False) + "\n")
