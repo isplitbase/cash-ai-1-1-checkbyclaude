@@ -32,6 +32,41 @@ WORKDIR = os.getenv("WORKDIR", "/tmp")
 Path(WORKDIR).mkdir(parents=True, exist_ok=True)
 
 
+# ============================================================
+# Claude モデル自動解決（preferred が将来 deprecated されても自動フォールバック）
+# ============================================================
+_CLAUDE_MODEL_CACHE: dict = {}
+
+def _resolve_claude_model(_client, preferred: str = "claude-sonnet-4-6", family: str = "sonnet") -> str:
+    """preferred モデルが使えればそれを返す。無ければ Models API から同ファミリーの最新版を選ぶ。
+    API失敗時は preferred を返す（既存動作と等価）。プロセス内キャッシュ済み。"""
+    import re as _re
+    key = (preferred, family)
+    if key in _CLAUDE_MODEL_CACHE:
+        return _CLAUDE_MODEL_CACHE[key]
+    chosen = preferred
+    try:
+        resp = _client.models.list(limit=100)
+        available = {m.id for m in resp.data}
+        if preferred not in available:
+            pat = _re.compile(rf"^claude-{family}-(\d+)-(\d+)$")
+            cands = []
+            for mid in available:
+                m = pat.match(mid)
+                if m:
+                    cands.append((int(m.group(1)), int(m.group(2)), mid))
+            if cands:
+                cands.sort(reverse=True)
+                chosen = cands[0][2]
+                print(f"[INFO] Claude model: '{preferred}' not available, switched to '{chosen}'", flush=True)
+            else:
+                print(f"[WARN] Claude model: family '{family}' not found, keeping preferred '{preferred}'", flush=True)
+    except Exception as e:
+        print(f"[WARN] Claude model resolve failed ({type(e).__name__}: {e}), keeping preferred '{preferred}'", flush=True)
+    _CLAUDE_MODEL_CACHE[key] = chosen
+    return chosen
+
+
 
 def call_claude_with_json_retry(*, create_fn, extract_text_fn, parse_fn, validate_fn=None, label="claude"):
     """
@@ -216,6 +251,7 @@ MODEL  = "claude-sonnet-4-6"
 MODEL = os.getenv("CLAUDE_MODEL", MODEL)
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+MODEL = _resolve_claude_model(client, preferred=MODEL)
 
 PERIODS = ["今期", "前期", "前々期"]
 
