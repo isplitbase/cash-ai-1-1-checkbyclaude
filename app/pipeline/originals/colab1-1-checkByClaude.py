@@ -291,83 +291,27 @@ def get(section_data, name, period):
 
 
 # ============================================================
-# ファイル読み込み
+# データ読み込み（このシステムはPDFを渡さない＝読取済みデータのみをチェック）
 # ============================================================
 print("=" * 60)
-print("  ファイル読み込み")
+print("  データ読み込み")
 print("=" * 60)
-pdf_names    = [Path(p).name for p in pdf_paths]
-pdf_b64_list = [load_pdf_as_base64(p) for p in pdf_paths]
 # json_data はヘッダで payload から構成済み
 bs  = json_data.get("BS", [])
 pl  = json_data.get("PL", [])
 mfg = json_data.get("製造原価", [])
-print(f"PDF : {pdf_names}")
 print(f"JSON: keys={list(json_data.keys())}")
 
 
 # ============================================================
-# Agent1: PDF読取チェック（Claude API）
+# Agent1: PDF読取品質チェックは廃止（PDFは渡らない設計のためスキップ）
+#   → Agent3 が参照できるよう空の結果を渡す
 # ============================================================
-print("\n" + "=" * 60)
-print("  Agent1: PDF読取チェック（Claude API）")
-print("=" * 60)
-
-AGENT1_PROMPT = f"""あなたはPDF読取品質の検査員です。
-添付された決算書PDFを見て、以下のみをチェックしてください。
-
-## チェック対象（読取品質のみ）
-- PDF画像の鮮明度・傾き・ノイズ
-- 文字の潰れ・かすれ・影による読みにくさ
-- 墨消し（黒塗り）の範囲と読取への影響
-- スキャン品質として問題のある箇所
-
-## 絶対に含めないこと
-- 数値の検算・計算の正誤チェック
-- 前期比・増減率などのコメント
-- 財務内容に関する意見
-
-## 出力形式（JSON形式のみ・他のテキスト不可）
-```json
-{{
-  "items": [
-    {{
-      "level": "ok" or "warn" or "error",
-      "title": "チェック項目名",
-      "detail": "1文で簡潔に"
-    }}
-  ]
-}}
-```
-"""
-
-agent1_blocks = []
-for b64, name in zip(pdf_b64_list, pdf_names):
-    agent1_blocks.append({
-        "type": "document",
-        "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
-        "title": name,
-    })
-agent1_blocks.append({"type": "text", "text": AGENT1_PROMPT})
-
-def _create_agent1():
-    return client.messages.create(
-        model=MODEL, max_tokens=2048,
-        messages=[{"role": "user", "content": agent1_blocks}]
-    )
-
 def _extract_text(msg):
     return "".join(b.text for b in msg.content if hasattr(b, "text"))
 
-msg1, agent1_result = call_claude_with_json_retry(
-    create_fn=_create_agent1,
-    extract_text_fn=_extract_text,
-    parse_fn=parse_json_response,
-    validate_fn=validate_agent1_json,
-    label="agent1"
-)
-print(f"完了 — トークン input:{msg1.usage.input_tokens:,} / output:{msg1.usage.output_tokens:,}")
-print(f"検出件数: {len(agent1_result.get('items', []))} 件")
+agent1_result = {"items": []}
+print("Agent1（PDF読取品質チェック）はスキップ（データのみチェック）")
 
 
 # ============================================================
@@ -527,15 +471,10 @@ print("  Agent3: 最終判定レビュアー（Claude API）")
 print("=" * 60)
 
 agent2_summary = json.dumps(agent2_items, ensure_ascii=False, indent=2)
-agent1_summary = json.dumps(agent1_result, ensure_ascii=False, indent=2)
 
 AGENT3_PROMPT = f"""あなたは決算書チェックの最終判定者です。
-以下の2つのエージェントの結果を統合し、最終チェック結果を作成してください。
-
-## Agent1の結果（PDF読取品質チェック）
-```json
-{agent1_summary}
-```
+以下のエージェントの結果を統合し、最終チェック結果を作成してください。
+（このシステムはPDFを参照せず、読取済みデータのみをチェックします）
 
 ## Agent2の結果（Python数値検算・確実）
 ```json
@@ -543,12 +482,10 @@ AGENT3_PROMPT = f"""あなたは決算書チェックの最終判定者です。
 ```
 
 ## 統合ルール（厳守）
-1. Agent2の計算結果が「一致（ok）」の項目について、Agent1が「不一致・要確認」と言っている場合は **Agent2を優先** してokにすること
-2. Agent2が「error」と判定した項目は必ずerrorとして残すこと
-3. Agent1のPDF品質指摘はそのまま採用してよい（計算と無関係なため）
-4. 「計算は合っているが〜」「一致しているが〜」という理由のwarnは全てokに変更すること
-5. 前期比・増減率・経営判断コメントは一切含めないこと
-6. warn/errorは「実際に数値が食い違っている」場合のみ使用すること
+1. Agent2が「error」と判定した項目は必ずerrorとして残すこと
+2. 「計算は合っているが〜」「一致しているが〜」という理由のwarnは全てokに変更すること
+3. 前期比・増減率・経営判断コメントは一切含めないこと
+4. warn/errorは「実際に数値が食い違っている」場合のみ使用すること
 
 ## 出力形式（JSON形式のみ・他テキスト不可）
 ```json
@@ -577,12 +514,11 @@ AGENT3_PROMPT = f"""あなたは決算書チェックの最終判定者です。
 ```
 
 セクション構成:
-1. id:"pdf_quality"         PDF品質チェック（Agent1の結果）
-2. id:"bs_check"            貸借対照表の検算（Agent2の結果）
-3. id:"pl_check"            損益計算書の検算（Agent2の結果）
-4. id:"manufacturing_check" 製造原価報告書の検算（Agent2の結果）
-5. id:"period_check"        期間整合性チェック（Agent2の結果）
-6. id:"data_quality"        データ品質（Agent2のデータ型チェック結果）
+1. id:"bs_check"            貸借対照表の検算（Agent2の結果）
+2. id:"pl_check"            損益計算書の検算（Agent2の結果）
+3. id:"manufacturing_check" 製造原価報告書の検算（Agent2の結果）
+4. id:"period_check"        期間整合性チェック（Agent2の結果）
+5. id:"data_quality"        データ品質（Agent2のデータ型チェック結果）
 """
 
 def _create_agent3():
@@ -649,9 +585,9 @@ with open(str(Path(WORKDIR) / "check_result.json"), "w", encoding="utf-8") as f:
 out_path = Path(WORKDIR) / "check_result.json"
 print(f"結果を {out_path} に保存しました")
 
-# トークン合計
-total_in  = msg1.usage.input_tokens  + msg3.usage.input_tokens
-total_out = msg1.usage.output_tokens + msg3.usage.output_tokens
+# トークン合計（Agent3のみ。Agent1は廃止）
+total_in  = msg3.usage.input_tokens
+total_out = msg3.usage.output_tokens
 print(f"APIトークン合計 — input:{total_in:,} / output:{total_out:,}")
 # stdout に最終JSONを出力（APIレスポンス用）
 sys.stdout.write(json.dumps(final_result, ensure_ascii=False) + "\n")
